@@ -14,34 +14,10 @@ from sklearn.model_selection import KFold
 import scipy.stats as sts 
 import xgboost as xgb
 from sklearn.linear_model import LinearRegression
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-
-
-# 读取数据
-print('reading data, loading...')
-train = pd.read_csv('../temp/train_th10.001.csv')
-test = pd.read_csv('../temp/test_th10.001.csv')
-feature_name = [f for f in train.columns if f not in ['ID','target']]
-
-
-
-# 标签转换
-train['target'] = np.log1p(train['target'] )
-
-# 数据归一化
-print('propressing data, loading...')
-scaler = MinMaxScaler(feature_range=(-1,1))
-train_scaler = scaler.fit_transform(train[feature_name])
-test_scaler = scaler.transform(test[feature_name])
-
-#train_scaler = np.log1p(train[feature_name])
-#test_scaler = np.log1p(test[feature_name])
-
-train[feature_name] = train_scaler
-test[feature_name] = test_scaler
-
-# 训练模型
-print('training model, loading...')
 def fevalfunc(pred,df):
     label = df.get_label().values.copy()
     score = np.sqrt(np.mean(np.power(pred-label,2)))
@@ -55,7 +31,7 @@ def fevalfunc_forxgb(pred,df):
 def feval(pred,label):
     return np.sqrt(np.mean(np.power(np.log1p(pred)-np.log1p(label),2)))
 
-def LGBCV(train,test,n_kf,feature_name,params):
+def LGBCV(train,test,n_kf,feature_name,params,verb=500):
     pred1 = np.zeros([train.shape[0]])
     pred2 = np.zeros([test.shape[0]])
     imps = np.zeros([len(feature_name),2])
@@ -67,7 +43,7 @@ def LGBCV(train,test,n_kf,feature_name,params):
                             lgbtrain,
                             num_boost_round=3000,
                             valid_sets=lgbtest,
-                            verbose_eval=100,
+                            verbose_eval=verb,
                             feval=None,
                             early_stopping_rounds=100)
         pred1[teidx] = rgs.predict( train[feature_name].iloc[teidx,:] )
@@ -80,7 +56,7 @@ def LGBCV(train,test,n_kf,feature_name,params):
     imps = pd.DataFrame(data = imps,columns=['gain','split'],index=feature_name )
     return metrics,imps,pred1,pred2
 
-def XGBCV(train,test,n_kf,feature_name,params):
+def XGBCV(train,test,n_kf,feature_name,params,verb=500):
     pred1 = np.zeros([train.shape[0]])
     pred2 = np.zeros([test.shape[0]])
     imps = np.zeros([len(feature_name),2])
@@ -96,7 +72,7 @@ def XGBCV(train,test,n_kf,feature_name,params):
                         feval=fevalfunc_forxgb,
                         maximize = False,
                         early_stopping_rounds=100,
-                        verbose_eval=100)
+                        verbose_eval=verb)
         pred1[teidx] = rgs.predict( xgbtest,ntree_limit=rgs.best_ntree_limit )
         pred2 += rgs.predict( ttest,ntree_limit=rgs.best_ntree_limit )
 #        imps[:,0] += rgs.get_score(importance_type='gain')
@@ -114,7 +90,7 @@ def remove_low_importace_feature(imps,drop_rate = 0.1):
     tick_feature_name = [f for f in imps.index[-Len:] ]
     return tick_feature_name
 
-def cross_top_feature(imps,train,test,TopLen = 5):
+def cross_top_feature(imps,train,test,TopLen = 10):
     top_feature_name = [f for f in imps.index[:TopLen] ]
     new_feature_train = np.zeros([train.shape[0],int(TopLen*(TopLen-1)/2)])
     new_feature_test = np.zeros([test.shape[0],int(TopLen*(TopLen-1)/2)])
@@ -132,9 +108,14 @@ def cross_top_feature(imps,train,test,TopLen = 5):
     ind = np.array(ind)
     new_feature_train = pd.DataFrame(new_feature_train[:,ind],columns = new_feature_name)
     new_feature_test = pd.DataFrame(new_feature_test[:,ind],columns = new_feature_name)
-    return new_feature_train,new_feature_test,new_feature_name
+    return new_feature_train,new_feature_test
 
-params = {   'boosting_type': 'gbdt',
+
+
+
+# 参数
+N_KF = 5    
+params_lgb = {   'boosting_type': 'gbdt',
             'objective': 'regression',
             'metric': 'rmse',
             'learning_rate': 0.005,
@@ -149,67 +130,75 @@ params = {   'boosting_type': 'gbdt',
 
 params_xgb = {'objective': 'reg:linear',
               'booster':'gbtree',
-          'eval_metric': 'rmse',
-          'eta': 0.005,
-          'max_depth': 20, 
-          'subsample': 0.7, 
-#          'min_child_weight':57,
-          'colsample_bytree': 0.05,
-          'alpha':2.5,
-          'lambda':5,
-          'random_state': 42, 
-          'silent': True}
+              'eval_metric': 'rmse',
+              'eta': 0.005,
+              'max_depth': 20, 
+              'subsample': 0.7, 
+#             'min_child_weight':57,
+              'colsample_bytree': 0.05,
+              'alpha':2.5,
+              'lambda':5,
+              'random_state': 42, 
+              'silent': True}
 
-n_kf = 5
 
-def training(imps,train,test,n_kf,feature_name,params,drop_rate=0.01,top_featuren_num = 5):
-    # 1st train model
-#    metrics,imps,pred1,pred2 = LGBCV(train,test,n_kf,feature_name,params)
-    # sort feature by featureimportance
-    imps['score'] = imps['gain'] * imps['split']
-    imps.sort_values(by='score',inplace = True,ascending = False)
-    # remove low importance feature
-    tick_feature_name = remove_low_importace_feature(imps,drop_rate)
-    # generate poly features
-    poly_train,poly_test,poly_feature_name = cross_top_feature(imps,train,test,top_featuren_num)
-    # update train and test set
-    train = pd.concat([train,poly_train],axis = 1)
-    test = pd.concat([test,poly_test],axis = 1)
-    # update useful feature name
-    feature_name = list(set([f for f in train.columns if f not in ['ID','target']])-set(tick_feature_name))
-    print('*'*50)
-    print('new feature nums: {0}'.format(len(feature_name)))
-    print('*'*50)    
-    # 2nd train model
-    metrics_2nd,imps_2nd,pred1_2nd,pred2_2nd = LGBCV(train,test,n_kf,feature_name,params)
-#    print('1st model metrics:{0} , 2nd model metrics{1}'.format(metrics,metrics_2nd))
-#    if metrics< metrics_2nd:
-#        return metrics,imps,pred1,pred2
-#    else:
-    return metrics_2nd,imps_2nd,pred1_2nd,pred2_2nd
-    
-metrics_lgb1,imps,pred1_lgb1,pred2_lgb1 = LGBCV(train,test,n_kf,feature_name,params)
-#imps.sort_values(by='split',inplace = True,ascending = False)
-#tick_feature = remove_low_importace_feature(imps,drop_rate = 0.2)
-#new_feature_name = list(set(feature_name)-set(tick_feature))
-#metrics_lgb,imps,pred1_lgb,pred2_lgb = LGBCV(train,test,n_kf,new_feature_name,params)
-#
-#metrics_xgb,imps,pred1_xgb,pred2_xgb = XGBCV(train,test,n_kf,feature_name,params_xgb)
-#
-#lr = LinearRegression()
-#lr.fit( np.vstack((pred1_lgb,pred1_xgb)).T, train['target'] )
-#pred1 = lr.predict( np.vstack((pred1_lgb,pred1_xgb)).T  )
-#pred2 = lr.predict( np.vstack((pred2_lgb,pred2_xgb)).T  )
-#metrics = np.round(feval(np.expm1(pred1),np.expm1(train['target'])),3)
-#
-#result = test[['ID','target']]
-#result['target'] = np.expm1(pred2)
-#
-#if np.any(pred2 < 0):
-#    print('result includes negtive value, please check again')
-#else:
-#    time_info = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-#    result.to_csv('../submit/submission_{0}_{1}.csv'.format(metrics,time_info), index=False)
+# 读取数据
+print('reading data, loading...')
+train = pd.read_csv('../temp/train_version_1.1.csv')
+test = pd.read_csv('../temp/test_version_1.1.csv')
+feature_name = [f for f in train.columns if f not in ['ID','target']]
+
+# 训练gbm模型
+print('training model, loading...')
+
+print('1st time train lgb model, loading...')    
+metrics_lgb1,imps_lgb1,pred1_lgb1,pred2_lgb1 = LGBCV(train,test,N_KF,feature_name,params_lgb)
+print('*'*50)
+print('1st time lgb model rmsle:{0}'.format(metrics_lgb1))
+print('*'*50)
+#imps_lgb1.sort_values(by='split',inplace = True,ascending = False)
+#print('remove low important feature, loading...') 
+#tick_feature = remove_low_importace_feature(imps_lgb1,drop_rate = 0.2)
+#print('generate cross feature, loading...') 
+#train_cross,test_cross = cross_top_feature(imps_lgb1,train,test,TopLen=10)
+#print('generate pca feature, loading...') 
+#train_pca,test_pca = generate_pca_feature(imps_lgb1,train,test,toplen=100,components_radio=0.85)
+#new_train = pd.concat([train,train_cross,train_pca],axis = 1)
+#new_test = pd.concat([test,test_cross,test_pca])
+#new_feature_name = list(set(feature_name) - set(tick_feature))
+#print('*'*50)
+#print('total feature nums: {0}'.format(len(feature_name)))
+#print('*'*50)
+#print('2nd time train lgb model, loading...') 
+#metrics_lgb,imps_lgb,pred1_lgb,pred2_lgb = LGBCV(train,test,N_KF,new_feature_name,params_lgb)
+#print('*'*50)
+#print('2nd time lgb model rmsle:{0}'.format(metrics_lgb))
+#print('*'*50)
+print('train xgb model, loading...') 
+metrics_xgb,imps_xgb,pred1_xgb,pred2_xgb = XGBCV(train,test,N_KF,feature_name,params_xgb)
+print('*'*50)
+print('xgb model rmsle:{0}'.format(metrics_xgb))
+print('*'*50)
+   
+lr = LinearRegression()
+lr.fit( np.vstack((pred1_lgb1,pred1_xgb)).T, train['target'] )
+pred1 = lr.predict( np.vstack((pred1_lgb1,pred1_xgb)).T  )
+pred2 = lr.predict( np.vstack((pred2_lgb1,pred2_xgb)).T  )
+
+metrics = np.round(feval(np.expm1(pred1),np.expm1(train['target'])),3)
+
+print('*'*50)
+print('ensemable model rmsle:{0}'.format(metrics))
+print('*'*50) 
+
+result = test[['ID','target']]
+result['target'] = np.expm1(pred2)
+
+if np.any(pred2 < 0):
+    print('result includes negtive value, please check again')
+else:
+    time_info = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    result.to_csv('../submit/submission_{0}_{1}.csv'.format(metrics,time_info), index=False)
     
 
 
